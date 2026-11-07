@@ -1,0 +1,6 @@
+RapidCRC Unicode: https://github.com/OV2/RapidCRC-Unicode
+Inspected commit: adb927b1c144dee194f196ad51d23819f5167f28
+The application requires a separately installed RapidCRC Unicode executable.
+RapidCRC is GPL-2.0; its source and binaries are not bundled with PyNup.
+The SHA-256 checksum lists opened for verification use RapidCRC's
+"<sha256> *<absolute path>" format.

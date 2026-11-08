@@ -1,6 +1,3 @@
-@ -1,2 +1,121 @@
-# PyNup
-Interfaz grafica para el formato NUP
 <div align="center">
 
 # 🖥️ PyNup

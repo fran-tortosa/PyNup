@@ -1,0 +1,7 @@
+`icono.png` es la imagen maestra que PyNup utiliza para todos sus iconos.
+Debe ser cuadrada y se recomienda conservar la resolución original y el fondo
+transparente.
+
+Para regenerar los tamaños de ventana, barra de tareas y el icono del
+ejecutable, ejecuta `..\preparar-icono.ps1` desde la carpeta del código beta
+antes de compilar.

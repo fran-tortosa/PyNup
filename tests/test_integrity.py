@@ -28,14 +28,34 @@ class ManifestTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_round_trip_with_sha256_and_listings(self) -> None:
-        count = create_manifest(self.source, self.manifest, "SHA-256", True)
-        result = compare_manifest(self.source, self.manifest, "SHA-256", True)
+        created: list[tuple[int, int, str]] = []
+        count = create_manifest(
+            self.source,
+            self.manifest,
+            "SHA-256",
+            True,
+            lambda done, total, name: created.append((done, total, name)),
+        )
+        reviewed: list[tuple[int, int, str]] = []
+        result = compare_manifest(
+            self.source,
+            self.manifest,
+            "SHA-256",
+            True,
+            progress=lambda done, total, name: reviewed.append(
+                (done, total, name)
+            ),
+        )
         lines = self.manifest.read_text(encoding="utf-8-sig").splitlines()
 
         self.assertEqual(count, 3)
         self.assertTrue(all(line[64:66] == " *" for line in lines))
         self.assertTrue(result.matches)
         self.assertEqual(result.checked, 3)
+        self.assertEqual([done for done, _, _ in created], [1, 2, 3])
+        self.assertEqual([done for done, _, _ in reviewed], [1, 2, 3])
+        self.assertTrue(all(total == 3 for _, total, _ in created))
+        self.assertTrue(all(total == 3 for _, total, _ in reviewed))
 
     def test_sha512_and_listing_exclusion(self) -> None:
         manifest = self.root / "original.sha512"

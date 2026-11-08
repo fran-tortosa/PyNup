@@ -5,6 +5,12 @@ import ntpath
 import posixpath
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Callable
+
+ManifestProgressFunction = Callable[[int, int, str], None]
+ManifestComparisonFunction = Callable[
+    [str, str, str | None, str | None], None
+]
 
 HASH_ALGORITHMS = {
     "SHA-256": ("sha256", 64, ".sha256"),
@@ -49,10 +55,16 @@ def _files(root: Path, include_listings: bool) -> list[Path]:
     )
 
 
-def _hash_file(path: Path, algorithm: str) -> str:
+def _hash_file(
+    path: Path,
+    algorithm: str,
+    cancel_check: Callable[[], None] | None = None,
+) -> str:
     digest = hashlib.new(algorithm)
     with path.open("rb") as stream:
         while chunk := stream.read(CHUNK_SIZE):
+            if cancel_check is not None:
+                cancel_check()
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -62,6 +74,7 @@ def create_manifest(
     manifest_path: Path,
     algorithm: str,
     include_listings: bool,
+    progress: ManifestProgressFunction | None = None,
 ) -> int:
     algorithm_name, _, _ = _algorithm_details(algorithm)
     files = _files(root, include_listings)
@@ -72,9 +85,11 @@ def create_manifest(
     with manifest_path.open(
         "x", encoding="utf-8-sig", newline="\r\n"
     ) as manifest:
-        for path in files:
+        for index, path in enumerate(files, start=1):
             relative_path = path.relative_to(root).as_posix()
             manifest.write(f"{_hash_file(path, algorithm_name)} *{relative_path}\n")
+            if progress is not None:
+                progress(index, len(files), relative_path)
     return len(files)
 
 
@@ -112,6 +127,8 @@ def create_manifest_for_sources(
     manifest_path: Path,
     algorithm: str,
     include_listings: bool,
+    cancel_check: Callable[[], None] | None = None,
+    progress: ManifestProgressFunction | None = None,
 ) -> int:
     algorithm_name, _, _ = _algorithm_details(algorithm)
     files = _scoped_files(root, source_directories, include_listings)
@@ -122,13 +139,18 @@ def create_manifest_for_sources(
     with manifest_path.open(
         "x", encoding="utf-8-sig", newline="\r\n"
     ) as manifest:
-        for relative_path in sorted(
+        ordered_paths = sorted(
             files, key=lambda name: name.encode("utf-8", "surrogateescape")
-        ):
+        )
+        for index, relative_path in enumerate(ordered_paths, start=1):
+            if cancel_check is not None:
+                cancel_check()
             manifest.write(
-                f"{_hash_file(files[relative_path], algorithm_name)} "
+                f"{_hash_file(files[relative_path], algorithm_name, cancel_check)} "
                 f"*{relative_path}\n"
             )
+            if progress is not None:
+                progress(index, len(ordered_paths), relative_path)
     return len(files)
 
 
@@ -233,6 +255,9 @@ def compare_manifest(
     manifest_path: Path,
     algorithm: str,
     include_listings: bool,
+    cancel_check: Callable[[], None] | None = None,
+    progress: ManifestProgressFunction | None = None,
+    comparison: ManifestComparisonFunction | None = None,
 ) -> ComparisonResult:
     algorithm_name, _, _ = _algorithm_details(algorithm)
     expected = _read_manifest(manifest_path, algorithm)
@@ -242,7 +267,9 @@ def compare_manifest(
         for path in actual_paths
     }
 
-    return _compare_entries(expected, actual, algorithm_name)
+    return _compare_entries(
+        expected, actual, algorithm_name, cancel_check, progress, comparison
+    )
 
 
 def compare_manifest_for_sources(
@@ -251,11 +278,16 @@ def compare_manifest_for_sources(
     manifest_path: Path,
     algorithm: str,
     include_listings: bool,
+    cancel_check: Callable[[], None] | None = None,
+    progress: ManifestProgressFunction | None = None,
+    comparison: ManifestComparisonFunction | None = None,
 ) -> ComparisonResult:
     algorithm_name, _, _ = _algorithm_details(algorithm)
     expected = _read_manifest(manifest_path, algorithm)
     actual = _scoped_files(root, source_directories, include_listings)
-    return _compare_entries(expected, actual, algorithm_name)
+    return _compare_entries(
+        expected, actual, algorithm_name, cancel_check, progress, comparison
+    )
 
 
 def read_manifest_entries(
@@ -269,14 +301,38 @@ def _compare_entries(
     expected: dict[str, str],
     actual: dict[str, Path],
     algorithm_name: str,
+    cancel_check: Callable[[], None] | None = None,
+    progress: ManifestProgressFunction | None = None,
+    comparison: ManifestComparisonFunction | None = None,
 ) -> ComparisonResult:
     missing = sorted(set(expected) - set(actual))
     extra = sorted(set(actual) - set(expected))
-    mismatched = sorted(
-        relative_name
-        for relative_name in set(expected) & set(actual)
-        if _hash_file(actual[relative_name], algorithm_name) != expected[relative_name]
-    )
+    mismatched: list[str] = []
+    ordered_names = sorted(expected)
+    for index, relative_name in enumerate(ordered_names, start=1):
+        if cancel_check is not None:
+            cancel_check()
+        actual_path = actual.get(relative_name)
+        expected_digest = expected[relative_name]
+        actual_digest: str | None = None
+        if actual_path is not None:
+            actual_digest = _hash_file(actual_path, algorithm_name, cancel_check)
+            if actual_digest != expected_digest:
+                mismatched.append(relative_name)
+                status = "HASH_DISTINTO"
+            else:
+                status = "COINCIDE"
+        else:
+            status = "FALTA"
+        if comparison is not None:
+            comparison(
+                relative_name, status, expected_digest, actual_digest
+            )
+        if progress is not None:
+            progress(index, len(ordered_names), relative_name)
+    if comparison is not None:
+        for relative_name in extra:
+            comparison(relative_name, "ADICIONAL", None, None)
     return ComparisonResult(
         checked=len(expected) - len(missing),
         missing=tuple(missing),
@@ -305,8 +361,3 @@ def display_comparison(result: ComparisonResult) -> list[str]:
         "RESULTADO: COINCIDE" if result.matches else "RESULTADO: NO COINCIDE"
     )
     return messages
-
-
-def default_manifest_path(source: Path, algorithm: str) -> Path:
-    _, _, extension = _algorithm_details(algorithm)
-    return source.parent / f"{source.name}_original{extension}"

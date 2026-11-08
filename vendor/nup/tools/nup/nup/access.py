@@ -7,8 +7,11 @@ Functions take the reader as their first argument.
 
 from __future__ import annotations
 
+import ctypes
 import os
-from typing import TYPE_CHECKING
+import re
+from pathlib import Path, PureWindowsPath
+from typing import BinaryIO, TYPE_CHECKING
 
 from . import format as F
 from . import meta as M
@@ -18,6 +21,51 @@ if TYPE_CHECKING:
     from .read import NupReader, PackageInfo
 
     from collections.abc import Callable
+
+
+_EXTRACTION_WRITE_BUFFER_SIZE = 16 << 20
+
+
+def _open_extracted_file(path: Path) -> BinaryIO:
+    if os.name != "nt":
+        return path.open("wb")
+
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        os.path.abspath(path),
+        0x40000000,
+        0x00000007,
+        None,
+        2,
+        0x80000000 | 0x08000000,
+        None,
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        descriptor = msvcrt.open_osfhandle(
+            handle, os.O_WRONLY | os.O_BINARY
+        )
+    except OSError:
+        kernel32.CloseHandle(handle)
+        raise
+    return os.fdopen(
+        descriptor, "wb", buffering=_EXTRACTION_WRITE_BUFFER_SIZE
+    )
 
 
 def find_package(
@@ -67,7 +115,7 @@ def find_child(r: NupReader, dir_index: int, name: bytes) -> NodeRef | None:
 def meta_records(r: NupReader, pkg: PackageInfo) -> list[tuple[int, bytes]]:
     out = []
     pos = 0
-    block = r._mm[pkg.meta_offset:pkg.meta_offset + pkg.meta_size]
+    block = r.read_at(pkg.meta_offset, pkg.meta_size)
     while pos + 8 <= len(block):
         t, _r, size = F._tlv_s.unpack_from(block, pos)
         if pos + 8 + size > len(block):
@@ -131,22 +179,54 @@ def extract_tree(
     dest: str,
     dir_index: int,
     progress: Callable[[int, NodeRef], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> int:
     """Extract a directory subtree to dest. Returns number of files written."""
     n = 0
-    os.makedirs(dest, exist_ok=True)
-    stack = [(dir_index, dest)]
+    destination = Path(dest)
+    destination.mkdir(parents=True, exist_ok=True)
+    root = destination.resolve()
+    stack = [(dir_index, root)]
     while stack:
+        if cancel_check:
+            cancel_check()
         di, dpath = stack.pop()
-        os.makedirs(dpath, exist_ok=True)
+        dpath.mkdir(parents=True, exist_ok=True)
         for child in iter_children(r, di):
-            cpath = os.path.join(dpath, child.name.decode("utf-8", "surrogateescape"))
+            if cancel_check:
+                cancel_check()
+            name = child.name.decode("utf-8", "surrogateescape")
+            if (
+                not name
+                or name in (".", "..")
+                or "/" in name
+                or "\\" in name
+                or any(ord(char) < 32 or char in '<>:"|?*' for char in name)
+                or name.endswith((" ", "."))
+                or PureWindowsPath(name).is_absolute()
+                or PureWindowsPath(name).drive
+                or re.match(
+                    r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)",
+                    name,
+                    re.I,
+                )
+            ):
+                raise F.NupError(f"unsafe path component in NUP: {child.name!r}")
+            cpath = dpath / name
+            try:
+                cpath.resolve().relative_to(root)
+            except ValueError as exc:
+                raise F.NupError(
+                    f"extraction path escapes destination: {child.name!r}"
+                ) from exc
             if child.is_dir:
                 stack.append((child.index, cpath))
             else:
-                data = r.read_file(child.index)
-                with open(cpath, "wb") as fh:
-                    fh.write(data)
+                with _open_extracted_file(cpath) as fh:
+                    for chunk in r.iter_file_chunks(child.index):
+                        if cancel_check:
+                            cancel_check()
+                        fh.write(chunk)
                 n += 1
                 if progress:
                     progress(n, child)

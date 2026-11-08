@@ -1,0 +1,4 @@
+Version: PyNup-1.1
+Source snapshot: stable release source
+Build output: ..\PyNup-1.1-estable\PyNup.exe
+Status: stable release

@@ -78,8 +78,8 @@ def _derive_uuid(pkg_records: list[F.Package]) -> bytes:
     return h.digest()[:16]
 
 
-STREAM_THRESHOLD = 256 << 20  # files above this are streamed, not held in RAM
-_STREAM_CHUNK = 4 << 20
+STREAM_THRESHOLD = 16 << 20
+_STREAM_CHUNK = 64 << 20
 
 
 def _write_extents(
@@ -88,33 +88,71 @@ def _write_extents(
     zc: zstandard.ZstdCompressor | None,
     blob_cursor: int,
     progress: Callable[[int, int, FileObj], None] | None = None,
+    byte_progress: Callable[[str, int, int, int, FileObj], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> int:
     """Append file extents (dedup by hash, 16-byte aligned). Returns end offset."""
     total = len(tree.files)
+    total_bytes = sum(os.path.getsize(fnode.src_path) for fnode in tree.files)
+    source_done = 0
+    hash_done = 0
+    stored_done = 0
     seen: dict[bytes, tuple[int, int, int]] = {}  # sha256 -> (offset, size, codec)
     for i, fnode in enumerate(tree.files):
+        if cancel_check:
+            cancel_check()
         with open(fnode.src_path, "rb") as fh:
             fnode.size = os.path.getsize(fnode.src_path)
 
             # Pass 1 - hash the whole file (streamed) for the dedup table.
             h = hashlib.sha256()
             left = fnode.size
+            hashed = 0
             while left:
+                if cancel_check:
+                    cancel_check()
                 chunk = fh.read(min(_STREAM_CHUNK, left))
                 if not chunk:
                     raise SystemExit(
                         f"pack: {fnode.src_path!r} changed while packing")
                 h.update(chunk)
                 left -= len(chunk)
+                hashed += len(chunk)
+                if byte_progress:
+                    byte_progress(
+                        "preparando",
+                        hash_done + hashed,
+                        total_bytes,
+                        stored_done,
+                        fnode,
+                    )
             fnode.sha256 = h.digest()
+            hash_done += fnode.size
 
             hit = seen.get(fnode.sha256)
             if hit is not None and fnode.size > 0:
                 # Dedup (SPEC §3.6): identical content shares one extent.
                 fnode.extent_offset, fnode.extent_size, codec = hit
                 fnode.codec = F.Codec(codec)
+                source_done += fnode.size
+                if byte_progress:
+                    byte_progress(
+                        "comprimiendo",
+                        source_done,
+                        total_bytes,
+                        stored_done,
+                        fnode,
+                    )
             elif fnode.size == 0:
                 fnode.extent_offset, fnode.extent_size, fnode.codec = 0, 0, F.CODEC_RAW
+                if byte_progress:
+                    byte_progress(
+                        "comprimiendo",
+                        source_done,
+                        total_bytes,
+                        stored_done,
+                        fnode,
+                    )
             else:
                 fh.seek(0)
                 aligned = (blob_cursor + F.EXTENT_ALIGN - 1) & ~(F.EXTENT_ALIGN - 1)
@@ -128,6 +166,8 @@ def _write_extents(
                     data = fh.read()
                     payload, codec = data, F.CODEC_RAW
                     if zc is not None:
+                        if cancel_check:
+                            cancel_check()
                         comp = zc.compress(data)
                         if len(comp) < fnode.size:
                             payload, codec = comp, F.CODEC_ZSTD
@@ -135,16 +175,27 @@ def _write_extents(
                     fnode.extent_size = len(payload)
                     fnode.codec = codec
                     blob_cursor = aligned + len(payload)
+                    if byte_progress:
+                        byte_progress(
+                            "comprimiendo",
+                            source_done + fnode.size,
+                            total_bytes,
+                            stored_done + len(payload),
+                            fnode,
+                        )
                 else:
                     # Stream in chunks: compress written as produced, bailing
                     # to raw the moment the output stops being smaller.
                     compressed = False
+                    stored = 0
                     if zc is not None:
                         co = zc.compressobj(fnode.size)
                         stored = 0
                         bail = False
                         left = fnode.size
                         while left and not bail:
+                            if cancel_check:
+                                cancel_check()
                             chunk = fh.read(min(_STREAM_CHUNK, left))
                             if not chunk:
                                 raise SystemExit(
@@ -159,11 +210,27 @@ def _write_extents(
                                     # output has caught up with input: the
                                     # final frame cannot end up smaller
                                     bail = True
+                            if byte_progress:
+                                byte_progress(
+                                    "comprimiendo",
+                                    source_done + consumed,
+                                    total_bytes,
+                                    stored_done + stored,
+                                    fnode,
+                                )
                         if not bail:
                             piece = co.flush()
                             if piece:
                                 out.write(piece)
                                 stored += len(piece)
+                            if byte_progress:
+                                byte_progress(
+                                    "comprimiendo",
+                                    source_done + fnode.size,
+                                    total_bytes,
+                                    stored_done + stored,
+                                    fnode,
+                                )
                             if stored >= fnode.size:
                                 bail = True
                         compressed = not bail
@@ -171,19 +238,41 @@ def _write_extents(
                         out.seek(aligned)  # overwrite whatever the bailed frame wrote
                         fh.seek(0)  # the bailed compression pass left the input mid-file
                         left = fnode.size
+                        stored = 0
                         while left:
+                            if cancel_check:
+                                cancel_check()
                             chunk = fh.read(min(_STREAM_CHUNK, left))
                             if not chunk:
                                 raise SystemExit(
                                     f"pack: {fnode.src_path!r} changed while packing")
                             left -= len(chunk)
                             out.write(chunk)
+                            stored += len(chunk)
+                            if byte_progress:
+                                byte_progress(
+                                    "comprimiendo",
+                                    source_done + fnode.size - left,
+                                    total_bytes,
+                                    stored_done + stored,
+                                    fnode,
+                                )
                         fnode.extent_size = fnode.size
                         fnode.codec = F.CODEC_RAW
                     else:
                         fnode.extent_size = stored
                         fnode.codec = F.CODEC_ZSTD
                     blob_cursor = aligned + fnode.extent_size
+                    if byte_progress:
+                        byte_progress(
+                            "comprimiendo",
+                            source_done + fnode.size,
+                            total_bytes,
+                            stored_done + fnode.extent_size,
+                            fnode,
+                        )
+                source_done += fnode.size
+                stored_done += fnode.extent_size
                 seen[fnode.sha256] = (fnode.extent_offset, fnode.extent_size, fnode.codec)
         if progress:
             progress(i + 1, total, fnode)
@@ -295,6 +384,8 @@ def pack(
     icons: dict[str | None, str] | None = None,
     split: bool = False,
     progress: Callable[[int, int, FileObj], None] | None = None,
+    byte_progress: Callable[[str, int, int, int, FileObj], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> list[PackInput]:
     if not have_zstd():
         print("pack: warning: zstandard not installed; writing raw (uncompressed) extents",
@@ -325,6 +416,8 @@ def pack(
             level=level,
             keep_listings=keep_listings,
             progress=progress,
+            byte_progress=byte_progress,
+            cancel_check=cancel_check,
             **meta,
         )
     return packages
@@ -342,6 +435,8 @@ def _pack_container(
     names: dict[str | None, str] | None = None,
     icons: dict[str | None, str] | None = None,
     progress: Callable[[int, int, FileObj], None] | None = None,
+    byte_progress: Callable[[str, int, int, int, FileObj], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> list[PackInput]:
     if os.path.exists(out_path):
         raise SystemExit(f"pack: refusing to overwrite {out_path}")
@@ -381,7 +476,9 @@ def _pack_container(
 
     with open(out_path, "wb") as out:
         out.write(b"\0" * blob_offset)  # placeholder for header + TOC
-        blob_cursor = _write_extents(out, tree, zc, blob_offset, progress)
+        blob_cursor = _write_extents(
+            out, tree, zc, blob_offset, progress, byte_progress, cancel_check
+        )
         dump_label = os.path.basename(os.path.normpath(src))
         meta_offsets, blob_cursor = _write_meta_blocks(out, packages, dump_label,
                                                        names, icons, display_version,

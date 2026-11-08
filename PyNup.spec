@@ -14,8 +14,17 @@ a = Analysis(
     datas=[
         (str(nup_sources), "vendor/nup/tools/nup"),
         (str(project_root / "vendor" / "nup" / "LICENSE"), "vendor/nup"),
+        (str(project_root / "db-name.ini"), "."),
+        *[
+            (str(project_root / "assets" / f"pynup-{size}.png"), "assets")
+            for size in (16, 24, 32, 48, 64, 128, 256)
+        ],
+        (str(project_root / "assets" / "pynup.ico"), "assets"),
     ],
-    hiddenimports=collect_submodules("zstandard"),
+    hiddenimports=[
+        *collect_submodules("zstandard"),
+        "ctypes.wintypes",
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -33,6 +42,7 @@ exe = EXE(
     a.datas,
     [],
     name="PyNup",
+    icon=str(project_root / "assets" / "pynup.ico"),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

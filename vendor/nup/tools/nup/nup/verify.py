@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import hashlib
+from typing import TYPE_CHECKING
 
 from . import format as F
 from .read import NupReader
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
-def verify(path: str, deep: bool = False) -> tuple[bool, list[str]]:
+
+def verify(
+    path: str,
+    deep: bool = False,
+    cancel_check: Callable[[], None] | None = None,
+) -> tuple[bool, list[str]]:
     """Returns (ok, problems). `deep` recomputes every file's SHA-256."""
     problems: list[str] = []
     try:
@@ -18,6 +26,14 @@ def verify(path: str, deep: bool = False) -> tuple[bool, list[str]]:
 
     def fail(msg: str) -> None:
         problems.append(msg)
+
+    def check_cancelled() -> None:
+        if cancel_check is not None:
+            try:
+                cancel_check()
+            except Exception:
+                r.close()
+                raise
 
     s = r.super
     if s["toc_offset"] != F.HEADER_SIZE:
@@ -29,11 +45,13 @@ def verify(path: str, deep: bool = False) -> tuple[bool, list[str]]:
     ranges = sorted((first, first + count, i)
                     for i, (_, first, count) in enumerate(r.dirs))
     for (a1, a2, ai), (b1, b2, bi) in zip(ranges, ranges[1:]):
+        check_cancelled()
         if a2 > b1:
             fail(f"child slot ranges overlap: dirs {ai} and {bi}")
 
     # sorted + unique children per dir (producer conformance §6.2)
     for di, (name, first, count) in enumerate(r.dirs):
+        check_cancelled()
         kids = r.children[first:first + count]
         names = []
         for cid in kids:
@@ -51,6 +69,7 @@ def verify(path: str, deep: bool = False) -> tuple[bool, list[str]]:
     for p in r.packages:
         stack: list[tuple[int, tuple[int, ...]]] = [(p.root_dir, (p.root_dir,))]
         while stack:
+            check_cancelled()
             di, path_ids = stack.pop()
             if di in path_ids[:-1]:
                 fail(f"cycle detected through dir {di}")
@@ -77,12 +96,16 @@ def verify(path: str, deep: bool = False) -> tuple[bool, list[str]]:
     if deep:
         seen_extents: dict[tuple[int, int, int], bytes] = {}
         for fi, (name, size, sha, eoff, esz, codec) in enumerate(r.files):
+            check_cancelled()
+            digest = hashlib.sha256()
             try:
-                data = r.read_file(fi)
+                for chunk in r.iter_file_chunks(fi):
+                    check_cancelled()
+                    digest.update(chunk)
             except F.NupError as e:
                 fail(f"file {fi} ({name!r}): read failed: {e}")
                 continue
-            if hashlib.sha256(data).digest() != sha:
+            if digest.digest() != sha:
                 fail(f"file {fi} ({name!r}): SHA-256 mismatch")
             if codec == F.CODEC_RAW and esz != size:
                 fail(f"file {fi} ({name!r}): raw extent size {esz} != {size}")

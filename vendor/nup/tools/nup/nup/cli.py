@@ -154,9 +154,9 @@ def _cmd_extract(args: argparse.Namespace) -> int:
             for fi in range(r.file_count):
                 name, size, sha, eoff, esz, codec = r.file_info(fi)
                 target = os.path.join(args.dest, f"{fi:05d}_{name.decode('utf-8', 'surrogateescape')}")
-                data = r.read_file(fi)
                 with open(target, "wb") as fh:
-                    fh.write(data)
+                    for chunk in r.iter_file_chunks(fi):
+                        fh.write(chunk)
                 n += 1
             print(f"extract: {n} files -> {args.dest}")
             return 0

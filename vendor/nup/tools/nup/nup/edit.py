@@ -29,7 +29,7 @@ _COPY_CHUNK: Final = 4 << 20
 def _old_block(r: NupReader, pkg: PackageInfo) -> bytes:
     if not pkg.meta_size:
         return b""
-    return bytes(r._mm[pkg.meta_offset:pkg.meta_offset + pkg.meta_size])
+    return r.read_at(pkg.meta_offset, pkg.meta_size)
 
 
 def _resolve_package(r: NupReader, package: str | None) -> PackageInfo:
@@ -109,7 +109,7 @@ def edit(path: str, *, package: str | None = None, name: str | None = None,
             new_file_size = cursor
 
             s = r.super
-            toc = bytearray(r._mm[s["toc_offset"]:s["toc_offset"] + s["toc_size"]])
+            toc = bytearray(r.read_at(s["toc_offset"], s["toc_size"]))
             pos = F._toc_head_s.size
             for i, p in enumerate(r.packages):
                 mo, ms = new_offsets[i]
@@ -128,7 +128,8 @@ def edit(path: str, *, package: str | None = None, name: str | None = None,
                 out.write(toc)
                 copy_pos = s["toc_offset"] + s["toc_size"]
                 while copy_pos < blob_end:
-                    chunk = r._mm[copy_pos:min(copy_pos + _COPY_CHUNK, blob_end)]
+                    chunk_size = min(_COPY_CHUNK, blob_end - copy_pos)
+                    chunk = r.read_at(copy_pos, chunk_size)
                     out.write(chunk)
                     copy_pos += len(chunk)
                 out.write(new_tail)

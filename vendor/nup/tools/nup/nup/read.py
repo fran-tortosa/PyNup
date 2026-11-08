@@ -9,16 +9,77 @@ Tree traversal, metadata access, and extraction live in .access.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Iterator
+import ctypes
 import hashlib
-import mmap
 import os
 import struct
-from typing import TYPE_CHECKING
+from typing import BinaryIO, TYPE_CHECKING
 
 from . import format as F
 
 if TYPE_CHECKING:
     from types import TracebackType
+
+
+def _open_sequential(path: str) -> BinaryIO:
+    if os.name != "nt":
+        return open(path, "rb")
+
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        os.path.abspath(path),
+        0x80000000,
+        0x00000007,
+        None,
+        3,
+        0x08000000,
+        None,
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        descriptor = msvcrt.open_osfhandle(
+            handle, os.O_RDONLY | os.O_BINARY
+        )
+    except OSError:
+        kernel32.CloseHandle(handle)
+        raise
+    return os.fdopen(descriptor, "rb")
+
+
+class _FileExtentReader:
+    __slots__ = ("_fh", "_offset", "_size", "_position")
+
+    def __init__(self, fh: BinaryIO, offset: int, size: int) -> None:
+        self._fh = fh
+        self._offset = offset
+        self._size = size
+        self._position = 0
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = self._size - self._position
+        size = min(size, self._size - self._position)
+        self._fh.seek(self._offset + self._position)
+        data = self._fh.read(size)
+        size = len(data)
+        self._position += size
+        return data
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,17 +113,13 @@ class NodeRef:
 
 
 class NupReader:
-    __slots__ = ("path", "_fh", "_mm", "super", "dir_count", "file_count", "pool", "packages", "files", "dirs", "children")
+    __slots__ = ("path", "_fh", "super", "dir_count", "file_count", "pool", "packages", "files", "dirs", "children")
     def __init__(self, path: str) -> None:
         self.path = path
-        self._fh = open(path, "rb")
-        self._mm: mmap.mmap | bytes = b""
+        self._fh = _open_sequential(path)
         try:
-            try:
-                self._mm = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
-            except ValueError:  # empty file
-                self._mm = b""
-            self.super = F.parse_super(self._mm[:F.HEADER_SIZE])
+            self._fh.seek(0)
+            self.super = F.parse_super(self._fh.read(F.HEADER_SIZE))
             real_size = os.fstat(self._fh.fileno()).st_size
             if self.super["file_size"] != real_size:
                 raise F.NupError(
@@ -75,23 +132,29 @@ class NupReader:
                 raise F.NupError("blob_offset not 16-byte aligned")
 
             toc_start = self.super["toc_offset"]
-            raw_toc = self._mm[toc_start:toc_start + self.super["toc_size"]]
+            raw_toc = self.read_at(toc_start, self.super["toc_size"])
             if hashlib.sha256(raw_toc).digest() != self.super["toc_sha256"]:
                 raise F.NupError("TOC SHA-256 mismatch - file corrupt or tampered")
             self._parse_toc(raw_toc)
             self._check_bounds()
         except BaseException:
-            # Never leak an open handle/mmap: on Windows it locks the file
-            # against rename/delete until GC.
+            # Never leak a file handle during partially completed parsing.
             self.close()
             raise
 
     def close(self) -> None:
-        mm = self._mm
-        if isinstance(mm, mmap.mmap):
-            mm.close()
-        self._mm = b""
         self._fh.close()
+
+    def read_at(self, offset: int, size: int) -> bytes:
+        if offset < 0 or size < 0:
+            raise ValueError("offset and size must be non-negative")
+        self._fh.seek(offset)
+        data = self._fh.read(size)
+        if len(data) != size:
+            raise F.NupError(
+                f"short read at {offset:#x}: {len(data)} != {size}"
+            )
+        return data
 
     def __enter__(self) -> "NupReader":
         return self
@@ -206,24 +269,53 @@ class NupReader:
     def file_info(self, file_index: int) -> tuple[bytes, int, bytes, int, int, F.Codec]:
         return self.files[file_index]
 
-    def read_file(self, file_index: int) -> bytes:
-        name, size, sha, eoff, esz, codec = self.files[file_index]
+    def iter_file_chunks(
+        self, file_index: int, chunk_size: int = 64 << 20
+    ) -> Iterator[bytes]:
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        name, size, _sha, eoff, esz, codec = self.files[file_index]
         if size == 0:
-            data = b""
-        elif codec == F.CODEC_RAW:
-            data = self._mm[eoff:eoff + esz]
-            if len(data) != esz:
-                raise F.NupError(f"short read for {name!r}")
+            return
+        total = 0
+        if codec == F.CODEC_RAW:
+            for offset in range(0, esz, chunk_size):
+                data = self.read_at(
+                    eoff + offset, min(chunk_size, esz - offset)
+                )
+                if not data:
+                    raise F.NupError(f"short read for {name!r}")
+                total += len(data)
+                if total > size:
+                    raise F.NupError(
+                        f"size mismatch for {name!r}: more than {size} bytes"
+                    )
+                yield data
         elif codec == F.CODEC_ZSTD:
             import zstandard
-            comp = self._mm[eoff:eoff + esz]
-            if len(comp) != esz:
-                raise F.NupError(f"short read for {name!r}")
+
+            source = _FileExtentReader(self._fh, eoff, esz)
             dctx = zstandard.ZstdDecompressor()
-            data = dctx.decompress(comp, max_output_size=size)
+            try:
+                with dctx.stream_reader(
+                    source, read_size=chunk_size, closefd=False
+                ) as stream:
+                    while data := stream.read(chunk_size):
+                        total += len(data)
+                        if total > size:
+                            raise F.NupError(
+                                f"size mismatch for {name!r}: "
+                                f"more than {size} bytes"
+                            )
+                        yield data
+            except zstandard.ZstdError as exc:
+                raise F.NupError(
+                    f"decompression failed for {name!r}: {exc}"
+                ) from exc
         else:
             raise F.NupError(f"unknown codec {codec}")
-        assert len(F.Codec) == 2
-        if len(data) != size:
-            raise F.NupError(f"size mismatch for {name!r}: {len(data)} != {size}")
-        return data
+        if total != size:
+            raise F.NupError(f"size mismatch for {name!r}: {total} != {size}")
+
+    def read_file(self, file_index: int) -> bytes:
+        return b"".join(self.iter_file_chunks(file_index))
